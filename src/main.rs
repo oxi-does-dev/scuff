@@ -42,10 +42,36 @@ fn dist_code(dist: usize) -> (u8, u8, u32) {
     }
     panic!("dist too large: {dist}");
 }
+// полный разбор (код, экстра-биты, значение экстра) через таблицы
+#[inline]
+fn len_ev(len: usize) -> (u16, u8, u32) {
+    let (lc, le) = lentab()[len];
+    (lc, le, len as u32 - LEN_BASE[lc as usize - 257] as u32)
+}
+#[inline]
+fn dist_ev(dist: usize) -> (u8, u8, u32) {
+    let (dc, de) = disttab()[dist];
+    (dc, de, dist as u32 - DIST_BASE[dc as usize])
+}
 fn match_cost(len: usize, dist: usize, cl: &[(u32, u8)], cd: &[(u32, u8)]) -> u32 {
-    let (lc, le, _) = len_code(len);
-    let (dc, de, _) = dist_code(dist);
+    let (lc, le) = lentab()[len];
+    let (dc, de) = disttab()[dist];
     cl[lc as usize].1 as u32 + le as u32 + cd[dc as usize].1 as u32 + de as u32
+}
+
+// предвычисленные таблицы кодов: match_cost дёргается сотни миллионов раз,
+// линейные сканы там это главный жор. строю один раз лениво.
+static LENTAB: std::sync::OnceLock<Vec<(u16, u8)>> = std::sync::OnceLock::new();
+static DISTTAB: std::sync::OnceLock<Vec<(u8, u8)>> = std::sync::OnceLock::new();
+fn lentab() -> &'static [(u16, u8)] {
+    LENTAB.get_or_init(|| {
+        (0..=MAX_MATCH).map(|l| { let (c, e, _) = len_code(l); (c, e) }).collect()
+    })
+}
+fn disttab() -> &'static [(u8, u8)] {
+    DISTTAB.get_or_init(|| {
+        (0..=WINDOW).map(|d| if d == 0 { (0, 0) } else { let (c, e, _) = dist_code(d); (c, e) }).collect()
+    })
 }
 
 // длина совпадения от (a, b), не дальше maxl. сравниваю по 8 байт сразу
@@ -72,20 +98,18 @@ fn hash3(d: &[u8], i: usize) -> usize {
 }
 
 // ищу все матчи в позиции i. на каждую длину запоминаю ближний, плюс один длинный отдельно
-fn find_matches(data: &[u8], i: usize, head: &[i32], prev: &[i32]) -> Vec<(usize, usize)> {
+fn find_matches_from(data: &[u8], i: usize, start: i32, prev: &[i32]) -> Vec<(usize, usize)> {
     let n = data.len();
     let mut out = Vec::new();
     if i + MIN_MATCH > n { return out; }
-    let h = hash3(data, i.min(n - 3));
     let lo = i.saturating_sub(WINDOW) as i32;
     // best_exact[e] = ближняя дистанция для матчей ровно длины e
     let mut best_exact = [usize::MAX; 259];
     let mut long_best = (0usize, usize::MAX); // самый длинный, длина может быть > 258
     let mut chain = 0;
-    let mut c = head[h];
+    let mut c = start;
     while c >= 0 && chain < MAX_CHAIN {
         let p = c as usize;
-        if p >= i { c = prev[p]; chain += 1; continue; } // это из будущего, скипаем
         if (p as i32) < lo { break; } // цепочка идёт назад, дальше только старьё
         if data[p] == data[i] {
             let maxl = MAX_MATCH.min(n - i);
@@ -318,10 +342,8 @@ fn tokens_freq(toks: &[Token], fl: &mut [u64], fd: &mut [u64]) {
         match *t {
             Token::Lit(b) => fl[b as usize] += 1,
             Token::Match { len, dist } => {
-                let (lc, _, _) = len_code(len);
-                let (dc, _, _) = dist_code(dist);
-                fl[lc as usize] += 1;
-                fd[dc as usize] += 1;
+                fl[lentab()[len].0 as usize] += 1;
+                fd[disttab()[dist].0 as usize] += 1;
             }
         }
     }
@@ -455,8 +477,8 @@ fn fixed_bits(toks: &[Token]) -> u64 {
         match *t {
             Token::Lit(x) => b += fixed_litlen(x as usize).1 as u64,
             Token::Match { len, dist } => {
-                let (lc, le, _) = len_code(len);
-                let (dc, de, _) = dist_code(dist);
+                let (lc, le, _) = len_ev(len);
+                let (dc, de, _) = dist_ev(dist);
                 b += fixed_litlen(lc as usize).1 as u64 + le as u64
                     + fixed_dist(dc as usize).1 as u64 + de as u64;
             }
@@ -471,11 +493,11 @@ fn write_fixed(w: &mut BitWriter, toks: &[Token]) {
         match *t {
             Token::Lit(b) => { let (c, l) = fixed_litlen(b as usize); w.bits(c, l); }
             Token::Match { len, dist } => {
-                let (lc, le, ev) = len_code(len);
+                let (lc, le, ev) = len_ev(len);
                 let (c, l) = fixed_litlen(lc as usize);
                 w.bits(c, l);
                 if le > 0 { w.bits(ev as u32, le); }
-                let (dc, de, evd) = dist_code(dist);
+                let (dc, de, evd) = dist_ev(dist);
                 let (c2, l2) = fixed_dist(dc as usize);
                 w.bits(c2, l2);
                 if de > 0 { w.bits(evd, de); }
@@ -498,11 +520,11 @@ fn write_dynamic(w: &mut BitWriter, toks: &[Token], ll: &[u8], dl: &[u8], nlit: 
         match *t {
             Token::Lit(b) => { let (c, l) = cl[b as usize]; w.bits(c, l); }
             Token::Match { len, dist } => {
-                let (lc, le, ev) = len_code(len);
+                let (lc, le, ev) = len_ev(len);
                 let (c, l) = cl[lc as usize];
                 w.bits(c, l);
                 if le > 0 { w.bits(ev as u32, le); }
-                let (dc, de, evd) = dist_code(dist);
+                let (dc, de, evd) = dist_ev(dist);
                 let (c2, l2) = cd[dc as usize];
                 w.bits(c2, l2);
                 if de > 0 { w.bits(evd, de); }
@@ -529,6 +551,25 @@ fn encode_block(data: &[u8], bs: usize, be: usize, mcached: &[Vec<(usize, usize)
         let cd = canon_codes(&dl);
         // проход 2: с нормальными ценами
         let toks2 = parse_block(data, bs, be, mcached, &cl, &cd);
+        // если уже сошлось с первым, дальше крутить смысла нет
+        if toks2 == t1 {
+            let (llm, dlm, nlitm, ndistm) = trees_for(&toks2);
+            let clm = canon_codes(&llm);
+            let cdm = canon_codes(&dlm);
+            let dynm = data_bits(&toks2, &clm, &cdm) + tree_bits(&llm, &dlm, nlitm, ndistm);
+            let fixm = fixed_bits(&toks2);
+            if fixm < dynm {
+                let mut w = BitWriter::new();
+                write_fixed(&mut w, &toks2);
+                let (b, n) = w.finish();
+                return (b, n, false);
+            } else {
+                let mut w = BitWriter::new();
+                write_dynamic(&mut w, &toks2, &llm, &dlm, nlitm, ndistm);
+                let (b, n) = w.finish();
+                return (b, n, true);
+            }
+        }
         let (llm, dlm, nlitm, ndistm) = trees_for(&toks2);
         let clm = canon_codes(&llm);
         let cdm = canon_codes(&dlm);
@@ -715,24 +756,58 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&bits);
         return out;
     }
-    // сначала границы: грубый парсинг всего файла, потом делю где выгодно
-    // хеши строю строго по порядку, иначе бюджет цепочки сгорает на будущих позициях
-    let mut head = vec![-1i32; HASH_SIZE];
+    // хеши считаю сразу все, цепочки линкую сортировкой по хешу (быстро, без сравнений байт).
+    // сам тяжёлый поиск потом идёт в потоках, prev только читается.
+    let nh = if n >= 3 { n - 2 } else { 0 }; // позиций с хешем
+    let mut hh = vec![0usize; nh];
+    for i in 0..nh { hh[i] = hash3(data, i); }
+    // counting sort по хешу, стабильно (внутри бакета позиции по возрастанию)
+    let mut cnt = vec![0u32; HASH_SIZE];
+    for &h in &hh { cnt[h] += 1; }
+    let mut off = vec![0u32; HASH_SIZE + 1];
+    for i in 0..HASH_SIZE { off[i + 1] = off[i] + cnt[i]; }
+    let mut order = vec![0u32; nh];
+    let mut cur = off[..HASH_SIZE].to_vec();
+    for (i, &h) in hh.iter().enumerate() {
+        order[cur[h] as usize] = i as u32;
+        cur[h] += 1;
+    }
+    // линкую соседей в бакетах: prev[pos] = предыдущая позиция с тем же хешем
     let mut prev = vec![-1i32; n];
-    // поиск на истории [0, gi), потом вставляю gi. так правильно, проверено
-    let mut cache: Vec<Vec<(usize, usize)>> = Vec::with_capacity(n);
-    for gi in 0..n {
-        if gi + MIN_MATCH <= n {
-            cache.push(find_matches(data, gi, &head, &prev));
-        } else {
-            cache.push(Vec::new());
-        }
-        if gi + 3 <= n {
-            let h = hash3(data, gi);
-            prev[gi] = head[h];
-            head[h] = gi as i32;
+    for h in 0..HASH_SIZE {
+        let mut last = -1i32;
+        for k in off[h]..off[h + 1] {
+            let pos = order[k as usize] as usize;
+            prev[pos] = last;
+            last = pos as i32;
         }
     }
+    // тяжёлый поиск матчей — в потоках, у каждого свой кусок позиций.
+    // куски не пересекаются, так что через сырой указатель (scope всё равно всех дождётся)
+    let ncpu = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4).min(32);
+    let mut cache: Vec<Vec<(usize, usize)>> = (0..n).map(|_| Vec::new()).collect();
+    let ptr = cache.as_mut_ptr() as usize; // через usize чтоб Send прошёл, куски не пересекаются
+    let pr: &[i32] = &prev;
+    std::thread::scope(|s| {
+        let chunk = (n + ncpu - 1) / ncpu;
+        let mut hs = Vec::new();
+        for t in 0..ncpu {
+            let lo = t * chunk;
+            let hi = ((t + 1) * chunk).min(n);
+            if lo >= hi { break; }
+            hs.push(s.spawn(move || {
+                let cref: &mut [Vec<(usize, usize)>] =
+                    unsafe { std::slice::from_raw_parts_mut((ptr as *mut Vec<(usize, usize)>).add(lo), hi - lo) };
+                for (j, slot) in cref.iter_mut().enumerate() {
+                    let gi = lo + j;
+                    if gi + MIN_MATCH <= n && gi < nh {
+                        *slot = find_matches_from(data, gi, pr[gi], pr);
+                    }
+                }
+            }));
+        }
+        for h in hs { h.join().unwrap(); }
+    });
     // грубый парсинг плоской моделью, нужен только для границ
     let flat_l: Vec<(u32, u8)> = (0..NLIT).map(|_| (0, 9)).collect();
     let flat_d: Vec<(u32, u8)> = (0..32).map(|_| (0, 6)).collect();
