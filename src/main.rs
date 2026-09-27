@@ -914,15 +914,108 @@ pub fn decompress(blob: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+// паковка папки в один блоб: SCUFFDIR1 + u32 кол-во + записи
+// запись: тип(1б: 0 файл, 1 папка) + len пути u16 + путь + [len данных u64 + данные]
+const DIR_MAGIC: &[u8; 9] = b"SCUFFDIR1";
+
+fn pack_dir(root: &std::path::Path) -> Result<Vec<u8>, String> {
+    // собираю все пути, сортирую чтоб детерминировано было
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let md = std::fs::symlink_metadata(&p).map_err(|e| format!("stat {}: {e}", p.display()))?;
+        if md.is_symlink() { continue; } // симлинки не тащу
+        if md.is_dir() {
+            let mut kids: Vec<std::path::PathBuf> = std::fs::read_dir(&p)
+                .map_err(|e| format!("readdir {}: {e}", p.display()))?
+                .filter_map(|e| e.ok().map(|x| x.path()))
+                .collect();
+            kids.sort();
+            for k in kids.into_iter().rev() { stack.push(k); }
+            // саму папку тоже кладу (кроме корня), чтоб пустые не терялись
+            if p != root { paths.push(p); }
+        } else if md.is_file() {
+            paths.push(p);
+        }
+    }
+    paths.sort();
+    let mut out = Vec::new();
+    out.extend_from_slice(DIR_MAGIC);
+    out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+    for p in &paths {
+        let rel = p.strip_prefix(root).map_err(|_| "bad prefix".to_string())?;
+        let rels = rel.to_string_lossy().replace('\\', "/");
+        let rb = rels.as_bytes();
+        if rb.len() > 0xFFFF { return Err(format!("too long path: {}", rels)); }
+        let is_dir = p.is_dir();
+        out.push(if is_dir { 1 } else { 0 });
+        out.extend_from_slice(&(rb.len() as u16).to_le_bytes());
+        out.extend_from_slice(rb);
+        if !is_dir {
+            let d = std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+            out.extend_from_slice(&(d.len() as u64).to_le_bytes());
+            out.extend_from_slice(&d);
+        }
+    }
+    Ok(out)
+}
+
+fn unpack_dir(blob: &[u8], dst: &std::path::Path) -> Result<usize, String> {
+    let mut p = 0;
+    if blob.len() < 13 || &blob[..9] != DIR_MAGIC { return Err("not a dir pack".into()); }
+    p += 9;
+    let n = u32::from_le_bytes(blob[p..p + 4].try_into().unwrap()) as usize;
+    p += 4;
+    for _ in 0..n {
+        if p + 3 > blob.len() { return Err("truncated dir pack".into()); }
+        let typ = blob[p];
+        p += 1;
+        let rl = u16::from_le_bytes(blob[p..p + 2].try_into().unwrap()) as usize;
+        p += 2;
+        if p + rl > blob.len() { return Err("truncated dir pack".into()); }
+        let rel = std::str::from_utf8(&blob[p..p + rl]).map_err(|_| "bad path utf8".to_string())?;
+        p += rl;
+        // чтоб .. не вылезли наружу
+        let target = dst.join(rel);
+        if !target.starts_with(dst) { return Err(format!("evil path: {rel}")); }
+        if typ == 1 {
+            std::fs::create_dir_all(&target).map_err(|e| format!("mkdir {}: {e}", target.display()))?;
+        } else if typ == 0 {
+            if blob.len() < p + 8 { return Err("truncated dir pack".into()); }
+            let ln = u64::from_le_bytes(blob[p..p + 8].try_into().unwrap()) as usize;
+            p += 8;
+            if blob.len() < p + ln { return Err("truncated dir pack".into()); }
+            if let Some(par) = target.parent() {
+                std::fs::create_dir_all(par).map_err(|e| format!("mkdir {}: {e}", par.display()))?;
+            }
+            std::fs::write(&target, &blob[p..p + ln]).map_err(|e| format!("write {}: {e}", target.display()))?;
+            p += ln;
+        } else {
+            return Err("bad entry type".into());
+        }
+    }
+    Ok(n)
+}
+
+fn is_dir_pack(blob: &[u8]) -> bool {
+    blob.len() >= 9 && &blob[..9] == DIR_MAGIC
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 3 || (a[1] != "c" && a[1] != "d") {
-        eprintln!("usage: scuff <c|d> <src> [dst]");
+        eprintln!("usage: scuff <c|d> <src> [dst]  (src может быть папкой)");
         std::process::exit(1);
     }
     let t0 = std::time::Instant::now();
     if a[1] == "c" {
-        let d = std::fs::read(&a[2]).unwrap();
+        let src = std::path::Path::new(&a[2]);
+        // папку сначала пакую в блоб, дальше всё одинаково
+        let d = if src.is_dir() {
+            pack_dir(src).unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); })
+        } else {
+            std::fs::read(src).unwrap_or_else(|_| { eprintln!("error: не открылся {}", a[2]); std::process::exit(1); })
+        };
         let c = compress(&d);
         let dst = if a.len() > 3 { a[3].clone() } else { format!("{}.scf", a[2]) };
         std::fs::write(&dst, &c).unwrap();
@@ -931,8 +1024,15 @@ fn main() {
     } else {
         let b = std::fs::read(&a[2]).unwrap();
         let d = decompress(&b).unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
-        let dst = if a.len() > 3 { a[3].clone() } else if a[2].ends_with(".scf") { a[2][..a[2].len()-4].to_string() } else { format!("{}.out", a[2]) };
-        std::fs::write(&dst, &d).unwrap();
-        println!("SCUFF decompressed {} -> {} ({}B) in {:.2?}", a[2], dst, d.len(), t0.elapsed());
+        // если внутри паковка папки, распаковываю в папку
+        if is_dir_pack(&d) {
+            let dst = if a.len() > 3 { a[3].clone() } else if a[2].ends_with(".scf") { a[2][..a[2].len()-4].to_string() } else { format!("{}_dir", a[2]) };
+            let n = unpack_dir(&d, std::path::Path::new(&dst)).unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
+            println!("SCUFF unpacked dir {} ({} entries) in {:.2?}", dst, n, t0.elapsed());
+        } else {
+            let dst = if a.len() > 3 { a[3].clone() } else if a[2].ends_with(".scf") { a[2][..a[2].len()-4].to_string() } else { format!("{}.out", a[2]) };
+            std::fs::write(&dst, &d).unwrap();
+            println!("SCUFF decompressed {} -> {} ({}B) in {:.2?}", a[2], dst, d.len(), t0.elapsed());
+        }
     }
 }
