@@ -5,11 +5,12 @@
 use std::collections::BinaryHeap;
 use std::cmp::Reverse;
 
-pub const MAGIC: &[u8; 6] = b"SCUFF\x04";
+pub const MAGIC: &[u8; 6] = b"SCUFF\x05";
 const WINDOW: usize = 262_144;
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 4096;
-const NLIT: usize = 290; // 0-255 литералы, 256 конец блока, 257+ длины
+const NLIT: usize = 291; // 0-255 литералы, 256 конец блока, 257-289 длины, 290 парамран
+const PARAM_MIN: usize = 3; // короче нет смысла, дп всё равно не возьмёт
 const HASH_BITS: usize = 17;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const MAX_CHAIN: usize = 1024;
@@ -89,8 +90,52 @@ fn match_len(data: &[u8], a: usize, b: usize, maxl: usize) -> usize {
     ml
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Token { Lit(u8), Match { len: usize, dist: usize } }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Token { Lit(u8), Match { len: usize, dist: usize }, Param { len: usize, stride: usize, steps: [u8; 64] } }
+
+// кандидат в кэше: обычный матч или парамран. steps[j] шаг колонки j, stride <= 64
+#[derive(Clone, Copy)]
+enum Cand { Match { len: usize, dist: usize }, Param { len: usize, stride: usize, steps: [u8; 64] } }
+
+const MAX_STRIDE: usize = 64;
+
+// страйдовый прогон: out[pos+k] = out[pos+k-s] + steps[k%s].
+// шаги беру из первой пары строк, дальше проверяю. s=1 это прогрессия подряд.
+// все шаги нулевые не предлагаю: это обычный lz, он дешевле.
+fn find_sparam(data: &[u8], i: usize, strides: &[usize]) -> Vec<(usize, usize, [u8; 64])> {
+    let n = data.len();
+    let mut out = Vec::new();
+    for &s in strides {
+        if s == 0 || s > MAX_STRIDE || s > i { continue; }
+        let minl = if s == 1 { PARAM_MIN } else { 16 };
+        // шаги меряю по первой паре строк: надо i+s байт
+        if i + s > n || i + minl > n { continue; }
+        let mut steps = [0u8; 64];
+        for j in 0..s {
+            steps[j] = data[i + j].wrapping_sub(data[i + j - s]);
+        }
+        if steps[..s].iter().all(|&t| t == 0) { continue; }
+        let mut len = s;
+        while len < MAX_MATCH && i + len < n {
+            let k = len;
+            if data[i + k] != data[i + k - s].wrapping_add(steps[k % s]) { break; }
+            len += 1;
+        }
+        if len >= minl { out.push((len, s, steps)); }
+    }
+    out
+}
+
+// цена парамрана: код 290 + страйд + маска s бит + шаги + длина
+fn param_cost(len: usize, stride: usize, steps: &[u8; 64], cl: &[(u32, u8)], cd: &[(u32, u8)]) -> u32 {
+    let (lc, le, _) = len_ev(len);
+    let (dc, de, _) = dist_ev(stride);
+    let mut nz = 0u32;
+    for j in 0..stride {
+        if steps[j] != 0 { nz += 1; }
+    }
+    cl[290].1 as u32 + cd[dc as usize].1 as u32 + de as u32 + stride as u32 + nz * 8 + cl[lc as usize].1 as u32 + le as u32
+}
 
 fn hash3(d: &[u8], i: usize) -> usize {
     let v = ((d[i] as u32) << 16) | ((d[i+1] as u32) << 8) | d[i+2] as u32;
@@ -98,7 +143,7 @@ fn hash3(d: &[u8], i: usize) -> usize {
 }
 
 // ищу все матчи в позиции i. на каждую длину запоминаю ближний, плюс один длинный отдельно
-fn find_matches_from(data: &[u8], i: usize, start: i32, prev: &[i32]) -> Vec<(usize, usize)> {
+fn find_matches_from(data: &[u8], i: usize, start: i32, prev: &[i32]) -> Vec<Cand> {
     let n = data.len();
     let mut out = Vec::new();
     if i + MIN_MATCH > n { return out; }
@@ -132,12 +177,24 @@ fn find_matches_from(data: &[u8], i: usize, start: i32, prev: &[i32]) -> Vec<(us
     let mut run_min = usize::MAX;
     for l in (MIN_MATCH..=258).rev() {
         if best_exact[l] < run_min { run_min = best_exact[l]; }
-        if run_min != usize::MAX { out.push((l, run_min)); }
+        if run_min != usize::MAX { out.push(Cand::Match { len: l, dist: run_min }); }
     }
     out.reverse();
     // длинный кандидат дп посчитает сам
     if long_best.0 > 258 {
-        out.push(long_best);
+        out.push(Cand::Match { len: long_best.0, dist: long_best.1 });
+    }
+    // страйдовые прогоны: мелкие страйды всегда + дистанции найденных матчей (там размер записи обычно)
+    let mut strides: Vec<usize> = vec![1, 2, 3, 4, 8, 16, 32];
+    for c in out.iter() {
+        if let Cand::Match { dist: d, .. } = *c {
+            if d >= 2 && !strides.contains(&d) && strides.len() < 40 {
+                strides.push(d);
+            }
+        }
+    }
+    for (plen, ps, psteps) in find_sparam(data, i, &strides) {
+        out.push(Cand::Param { len: plen, stride: ps, steps: psteps });
     }
     out
 }
@@ -304,33 +361,52 @@ fn crc32(d: &[u8]) -> u32 {
 }
 
 // дп по блоку [bs, be). cl/cd это цены символов
-fn parse_block(data: &[u8], bs: usize, be: usize, matches: &[Vec<(usize, usize)>],
+fn parse_block(data: &[u8], bs: usize, be: usize, matches: &[Vec<Cand>],
                cl: &[(u32, u8)], cd: &[(u32, u8)]) -> Vec<Token> {
     let m = be - bs;
     const INF: u32 = u32::MAX / 4;
     let mut dp = vec![INF; m + 1];
-    let mut pre: Vec<(usize, usize, usize)> = vec![(0, 0, 0); m + 1]; // откуда пришли, длина, дистанция
+    // pre: (откуда, что: 0 лит / 1 матч / 2 парам, длина, дист или страйд)
+    let mut pre: Vec<(usize, u8, usize, usize)> = vec![(0, 0, 0, 0); m + 1];
+    // шаги парамранов отдельно (в pre для них страйд лежит)
+    let mut psteps: Vec<[u8; 64]> = vec![[0; 64]; m + 1];
     dp[0] = 0;
     for i in 0..m {
         if dp[i] == INF { continue; }
         let gi = bs + i;
         // литерал
         let c = cl[data[gi] as usize].1 as u32;
-        if dp[i] + c < dp[i + 1] { dp[i + 1] = dp[i] + c; pre[i + 1] = (i, 1, 0); }
-        // матчи уже найдены, просто перебираем
-        for &(ml, d) in &matches[i] {
-            if i + ml > m { continue; }
-            let mc = match_cost(ml, d, cl, cd);
-            if dp[i] + mc < dp[i + ml] { dp[i + ml] = dp[i] + mc; pre[i + ml] = (i, ml, d); }
+        if dp[i] + c < dp[i + 1] { dp[i + 1] = dp[i] + c; pre[i + 1] = (i, 0, 1, 0); }
+        // кандидаты уже найдены, просто перебираем
+        for cd_ in &matches[i] {
+            match *cd_ {
+                Cand::Match { len: ml, dist: d } => {
+                    if i + ml > m { continue; }
+                    let mc = match_cost(ml, d, cl, cd);
+                    if dp[i] + mc < dp[i + ml] { dp[i + ml] = dp[i] + mc; pre[i + ml] = (i, 1, ml, d); }
+                }
+                Cand::Param { len: ml, stride: s, steps: st } => {
+                    if i + ml > m { continue; }
+                    let mc = param_cost(ml, s, &st, cl, cd);
+                    if dp[i] + mc < dp[i + ml] {
+                        dp[i + ml] = dp[i] + mc;
+                        pre[i + ml] = (i, 2, ml, s);
+                        psteps[i + ml] = st;
+                    }
+                }
+            }
         }
     }
     // откатываемся назад, собираем токены
     let mut toks = Vec::new();
     let mut i = m;
     while i > 0 {
-        let (p, l, d) = pre[i];
-        if l == 1 && d == 0 { toks.push(Token::Lit(data[bs + p])); }
-        else { toks.push(Token::Match { len: l, dist: d }); }
+        let (p, k, l, d) = pre[i];
+        match k {
+            0 => toks.push(Token::Lit(data[bs + p])),
+            1 => toks.push(Token::Match { len: l, dist: d }),
+            _ => toks.push(Token::Param { len: l, stride: d, steps: psteps[i] }),
+        }
         i = p;
     }
     toks.reverse();
@@ -344,6 +420,11 @@ fn tokens_freq(toks: &[Token], fl: &mut [u64], fd: &mut [u64]) {
             Token::Match { len, dist } => {
                 fl[lentab()[len].0 as usize] += 1;
                 fd[disttab()[dist].0 as usize] += 1;
+            }
+            Token::Param { len, stride, .. } => {
+                fl[290] += 1;
+                fl[lentab()[len].0 as usize] += 1;
+                fd[disttab()[stride].0 as usize] += 1;
             }
         }
     }
@@ -453,6 +534,7 @@ fn data_bits(toks: &[Token], cl: &[(u32, u8)], cd: &[(u32, u8)]) -> u64 {
         match *t {
             Token::Lit(x) => b += cl[x as usize].1 as u64,
             Token::Match { len, dist } => b += match_cost(len, dist, cl, cd) as u64,
+            Token::Param { len, stride, steps } => b += param_cost(len, stride, &steps, cl, cd) as u64,
         }
     }
     b + cl[256].1 as u64
@@ -470,7 +552,8 @@ fn tree_bits(ll: &[u8], dl: &[u8], nlit: usize, ndist: usize) -> u64 {
     w.total
 }
 
-// цена токенов через fixed таблицу, без заголовка
+// цена токенов через fixed таблицу, без заголовка.
+// парамранов там нет (кода 290 во fixed нет), такой вариант сразу отпадает
 fn fixed_bits(toks: &[Token]) -> u64 {
     let mut b = 0u64;
     for t in toks {
@@ -482,6 +565,7 @@ fn fixed_bits(toks: &[Token]) -> u64 {
                 b += fixed_litlen(lc as usize).1 as u64 + le as u64
                     + fixed_dist(dc as usize).1 as u64 + de as u64;
             }
+            Token::Param { .. } => return u64::MAX,
         }
     }
     b + fixed_litlen(256).1 as u64
@@ -496,12 +580,13 @@ fn write_fixed(w: &mut BitWriter, toks: &[Token]) {
                 let (lc, le, ev) = len_ev(len);
                 let (c, l) = fixed_litlen(lc as usize);
                 w.bits(c, l);
-                if le > 0 { w.bits(ev as u32, le); }
+                if le > 0 { w.bits(ev, le); }
                 let (dc, de, evd) = dist_ev(dist);
                 let (c2, l2) = fixed_dist(dc as usize);
                 w.bits(c2, l2);
                 if de > 0 { w.bits(evd, de); }
             }
+            Token::Param { .. } => panic!("fixed не умеет парамраны, сюда не должны попадать"),
         }
     }
     let (c, l) = fixed_litlen(256);
@@ -523,18 +608,37 @@ fn write_dynamic(w: &mut BitWriter, toks: &[Token], ll: &[u8], dl: &[u8], nlit: 
                 let (lc, le, ev) = len_ev(len);
                 let (c, l) = cl[lc as usize];
                 w.bits(c, l);
-                if le > 0 { w.bits(ev as u32, le); }
+                if le > 0 { w.bits(ev, le); }
                 let (dc, de, evd) = dist_ev(dist);
                 let (c2, l2) = cd[dc as usize];
                 w.bits(c2, l2);
                 if de > 0 { w.bits(evd, de); }
+            }
+            Token::Param { len, stride, steps } => {
+                let (c, l) = cl[290];
+                w.bits(c, l);
+                // страйд теми же кодами что дистанции, потом маска какие колонки едут, потом шаги, потом длина
+                let (dc, de, evd) = dist_ev(stride);
+                let (c2, l2) = cd[dc as usize];
+                w.bits(c2, l2);
+                if de > 0 { w.bits(evd, de); }
+                for j in 0..stride {
+                    w.bit(if steps[j] != 0 { 1 } else { 0 });
+                }
+                for j in 0..stride {
+                    if steps[j] != 0 { w.bits(steps[j] as u32, 8); }
+                }
+                let (lc, le, ev) = len_ev(len);
+                let (c3, l3) = cl[lc as usize];
+                w.bits(c3, l3);
+                if le > 0 { w.bits(ev, le); }
             }
         }
     }
     let (c, l) = cl[256];
     w.bits(c, l);
 }
-fn encode_block(data: &[u8], bs: usize, be: usize, mcached: &[Vec<(usize, usize)>], _is_final: bool) -> (Vec<u8>, u64, bool) {
+fn encode_block(data: &[u8], bs: usize, be: usize, mcached: &[Vec<Cand>], _is_final: bool) -> (Vec<u8>, u64, bool) {
     // первый проход с плоскими ценами, дальше уточняем
     let flat_l: Vec<(u32, u8)> = (0..NLIT).map(|_| (0, 9)).collect();
     let flat_d: Vec<(u32, u8)> = (0..32).map(|_| (0, 6)).collect();
@@ -785,7 +889,7 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
     // тяжёлый поиск матчей — в потоках, у каждого свой кусок позиций.
     // куски не пересекаются, так что через сырой указатель (scope всё равно всех дождётся)
     let ncpu = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4).min(32);
-    let mut cache: Vec<Vec<(usize, usize)>> = (0..n).map(|_| Vec::new()).collect();
+    let mut cache: Vec<Vec<Cand>> = (0..n).map(|_| Vec::new()).collect();
     let ptr = cache.as_mut_ptr() as usize; // через usize чтоб Send прошёл, куски не пересекаются
     let pr: &[i32] = &prev;
     std::thread::scope(|s| {
@@ -796,8 +900,8 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
             let hi = ((t + 1) * chunk).min(n);
             if lo >= hi { break; }
             hs.push(s.spawn(move || {
-                let cref: &mut [Vec<(usize, usize)>] =
-                    unsafe { std::slice::from_raw_parts_mut((ptr as *mut Vec<(usize, usize)>).add(lo), hi - lo) };
+                let cref: &mut [Vec<Cand>] =
+                    unsafe { std::slice::from_raw_parts_mut((ptr as *mut Vec<Cand>).add(lo), hi - lo) };
                 for (j, slot) in cref.iter_mut().enumerate() {
                     let gi = lo + j;
                     if gi + MIN_MATCH <= n && gi < nh {
@@ -822,13 +926,13 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
     }
     let mut bounds: Vec<(usize, usize)> = Vec::new();
     for (cs, ce) in init {
-        let mc: &[Vec<(usize, usize)>] = &cache[cs..ce];
+        let mc: &[Vec<Cand>] = &cache[cs..ce];
         let gtoks = parse_block(data, cs, ce, mc, &flat_l, &flat_d);
         // считаю на каком байте каждый токен начинается, для сплита надо
         let mut off = Vec::with_capacity(gtoks.len() + 1);
         off.push(cs);
         for t in &gtoks {
-            let l = match *t { Token::Lit(_) => 1, Token::Match { len, .. } => len };
+            let l = match *t { Token::Lit(_) => 1, Token::Match { len, .. } => len, Token::Param { len, .. } => len };
             off.push(off.last().unwrap() + l);
         }
         split_range(&gtoks, &off, 0, gtoks.len(), &mut bounds, 4);
@@ -839,7 +943,7 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
     std::thread::scope(|s| {
         let mut hs = Vec::new();
         for &(bs, be) in bounds.iter() {
-            let mc: &[Vec<(usize, usize)>] = &cache[bs..be];
+            let mc: &[Vec<Cand>] = &cache[bs..be];
             hs.push(s.spawn(move || {
                 encode_block(data, bs, be, mc, be == data.len())
             }));
@@ -922,6 +1026,45 @@ pub fn decompress(blob: &[u8]) -> Result<Vec<u8>, String> {
                 let s = dlit.sym(&mut r).ok_or("lit sym")?;
                 if s == 256 { break; }
                 if s < 256 { out.push(s as u8); }
+                else if s == 290 {
+                    // парамран: страйд кодами дистанций, маска колонок, шаги, длина.
+                    // out[pos+k] = out[pos+k-s] + steps[k%s]
+                    let ds = ddist.sym(&mut r).ok_or("param stride")?;
+                    let mut stride = DIST_BASE[ds] as usize;
+                    let de = DIST_EXTRA[ds];
+                    if de > 0 {
+                        let mut v = 0u32;
+                        for _ in 0..de { v = (v << 1) | r.bit().ok_or("stride extra")?; }
+                        stride += v as usize;
+                    }
+                    if stride == 0 || stride > 64 || stride > out.len() { return Err(format!("bad stride {stride} at {}", out.len())); }
+                    let mut steps = [0u8; 64];
+                    // сначала вся маска, потом шаги — как в кодере
+                    for j in 0..stride {
+                        if r.bit().ok_or("param mask")? == 1 {
+                            steps[j] = 1;
+                        }
+                    }
+                    for j in 0..stride {
+                        if steps[j] == 1 {
+                            steps[j] = r.bits(8).ok_or("param step")? as u8;
+                        }
+                    }
+                    let ls = dlit.sym(&mut r).ok_or("param len")?;
+                    if ls < 257 || ls > 289 { return Err("bad param len".into()); }
+                    let li = ls - 257;
+                    let mut len = LEN_BASE[li] as usize;
+                    let e = LEN_EXTRA[li];
+                    if e > 0 {
+                        let mut v = 0u32;
+                        for _ in 0..e { v = (v << 1) | r.bit().ok_or("len extra")?; }
+                        len += v as usize;
+                    }
+                    for k in 0..len {
+                        let base = out[out.len() - stride];
+                        out.push(base.wrapping_add(steps[k % stride]));
+                    }
+                }
                 else {
                     let li = s - 257;
                     let mut len = LEN_BASE[li] as usize;
@@ -949,7 +1092,7 @@ pub fn decompress(blob: &[u8]) -> Result<Vec<u8>, String> {
         }
         if typ == 1 {
             // fixed, коды точные (таблица неканоническая, через длины не восстановить)
-            let lc: Vec<(u32, u8)> = (0..NLIT).map(fixed_litlen).collect();
+            let lc: Vec<(u32, u8)> = (0..290).map(fixed_litlen).collect();
             let dc: Vec<(u32, u8)> = (0..32).map(fixed_dist).collect();
             let dlit = Decoder::from_codes(&lc);
             let ddist = Decoder::from_codes(&dc);
